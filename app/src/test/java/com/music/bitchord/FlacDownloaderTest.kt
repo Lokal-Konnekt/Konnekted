@@ -223,6 +223,18 @@ class FlacDownloaderTest {
     }
 
     @Test
+    fun `requests carry browser identity, never okhttp default`() = runBlocking {
+        route("/api/qobuz/search", searchJson("x"))
+        FlacDownloaderApi.searchQobuz("x", 1)
+        val sent = seen.map { it.getHeader("User-Agent").orEmpty() }
+        assertTrue(sent.isNotEmpty())
+        assertTrue(sent.toString(), sent.all { !it.startsWith("okhttp") })
+        assertTrue(sent.toString(), sent.all { "Chrome" in it })
+        val lang = seen.mapNotNull { it.getHeader("Accept-Language") }
+        assertTrue(lang.isNotEmpty())
+    }
+
+    @Test
     fun `kind carries the branded display name`() {
         assertEquals("BitChord Hi-Res Lossless Addon", SourceRegistry.HIRES_DISPLAY_NAME)
         assertEquals(SourceKind.HIRES, source().kind)

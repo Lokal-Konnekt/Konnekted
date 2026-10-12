@@ -202,7 +202,7 @@ object FlacDownloaderApi {
         return try {
             val request = Request.Builder()
                 .url("https://api.deezer.com/search?q=${encode(q)}&limit=20")
-                .header("Accept", "application/json")
+                .browserHeaders()
                 .build()
             val body = client.newCall(request).execute().use { response ->
                 if (!response.isSuccessful) return emptyList()
@@ -265,6 +265,7 @@ object FlacDownloaderApi {
             val request = Request.Builder()
                 .url("${base}/api/qobuz/queue")
                 .post(payload.toRequestBody("application/json".toMediaType()))
+                .browserHeaders()
                 .header("Accept", "application/json, text/plain, */*")
                 .header("X-DL-Token", token)
                 .header("Referer", "${base}/")
@@ -387,10 +388,27 @@ object FlacDownloaderApi {
 
     // ── Transport ─────────────────────────────────────────────────────
 
+    /**
+     * Every request carries a full browser header set, not just a UA
+     * string: bot defenses score header presence (Accept-Language,
+     * Sec-Fetch-*) alongside TLS, and OkHttp's bare default (`okhttp/x`)
+     * plus a missing language is two free tells. Same neutral Chrome
+     * identity the addon client sends.
+     */
+    private const val BROWSER_UA =
+        "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
+
+    private fun Request.Builder.browserHeaders(): Request.Builder =
+        header("User-Agent", BROWSER_UA)
+            .header("Accept", "application/json")
+            .header("Accept-Language", "en-US,en;q=0.9")
+            .header("Sec-Fetch-Site", "none")
+            .header("Sec-Fetch-Mode", "no-cors")
+
     private suspend fun get(url: String): String {
         val request = Request.Builder()
             .url(url)
-            .header("Accept", "application/json")
+            .browserHeaders()
             .header("Referer", "${base}/")
             .header("Origin", base)
             .build()
