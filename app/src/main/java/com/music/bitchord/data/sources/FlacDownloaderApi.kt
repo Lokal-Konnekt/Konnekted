@@ -2,6 +2,7 @@ package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.Http
 import com.music.bitchord.data.TrackLog
+import com.music.bitchord.data.settings.AppSettings
 import java.util.Collections
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.delay
@@ -76,6 +77,10 @@ object FlacDownloaderApi {
      */
     @Volatile
     private var tokenBlockedUntilMs = 0L
+
+    /** In-memory sp session; persisted via [AppSettings.fdlSp]. */
+    @Volatile
+    private var spToken: String? = null
     private const val TOKEN_BLOCK_MS = 10 * 60 * 1000L
     private const val TOKEN_ATTEMPTS = 3
     private const val TOKEN_RETRY_DELAY_MS = 1_500L
@@ -111,7 +116,10 @@ object FlacDownloaderApi {
     )
 
     @Serializable
-    private data class TokenResponse(@SerialName("t") val token: String? = null)
+    private data class TokenResponse(
+        @SerialName("t") val token: String? = null,
+        @SerialName("sp") val session: String? = null,
+    )
 
     @Serializable
     private data class QueueResponse(@SerialName("id") val jobId: String? = null)
@@ -219,29 +227,83 @@ object FlacDownloaderApi {
     // ── Stream issuance ───────────────────────────────────────────────
 
     /**
-     * A conversion token, or null when the backend's challenge refuses this
-     * network. Null is environmental and worth logging once: every queue
-     * attempt without it fails identically, so callers check this first.
+     * A conversion token, from the sp session when one exists.
+     *
+     * Two paths, in order. The sp session (captured by the one-tap guided
+     * unlock, rotated by every answer) exchanges without any challenge, so
+     * it is tried first and never backs off: it either answers or it is
+     * dead, and a dead one is dropped on the spot. With no session there
+     * is nothing headless that could succeed — a bare call only proves
+     * the challenge exists — so it fails fast instead of burning retries.
      */
     suspend fun prepareToken(force: Boolean = false): String? {
         if (!force && System.currentTimeMillis() < tokenBlockedUntilMs) return null
+        val sp = spToken
+            ?: runCatching { spReader() }.getOrDefault("").takeIf { it.isNotBlank() }?.also { spToken = it }
+        if (sp == null) {
+            tokenBlockedUntilMs = System.currentTimeMillis() + TOKEN_BLOCK_MS
+            return null
+        }
         repeat(TOKEN_ATTEMPTS) { attempt ->
             try {
-                val token = json.decodeFromString<TokenResponse>(get("${base}/prepare"))
-                    .token?.takeIf { it.isNotBlank() }
+                val answer = json.decodeFromString<TokenResponse>(postPrepare(mapOf("sp" to sp)))
+                answer.session?.takeIf { it.isNotBlank() }?.let { persistSp(it) }
+                val token = answer.token?.takeIf { it.isNotBlank() }
                 if (token != null) {
                     tokenBlockedUntilMs = 0L
                     return token
                 }
-                TrackLog.w(TAG, "  ✗ hifiresolver prepare refused (challenge?)")
+                TrackLog.w(TAG, "  ✗ hifiresolver session refused")
             } catch (e: Exception) {
                 coroutineContext.ensureActive()
                 TrackLog.d(TAG, "  ✗ hifiresolver prepare failed: ${e.message}")
             }
             if (attempt + 1 < TOKEN_ATTEMPTS) delay(TOKEN_RETRY_DELAY_MS)
         }
+        forgetSp()
         tokenBlockedUntilMs = System.currentTimeMillis() + TOKEN_BLOCK_MS
         return null
+    }
+
+    /** The live sp session, if the unlock captured one. Null clears it. */
+    fun loadSp(sp: String?) {
+        spToken = sp?.takeIf { it.isNotBlank() }
+    }
+
+    /**
+     * Persisted sp I/O. Production talks to AppSettings; tests swap in
+     * memory. Reading the flow never touches prefs, only writing does —
+     * and a writer that throws (no prefs, e.g. unit tests that forgot to
+     * swap) must not take the request down with it.
+     */
+    internal var spReader: () -> String = { AppSettings.fdlSp.value }
+    internal var spWriter: (String) -> Unit = { AppSettings.setFdlSp(it) }
+
+    private fun persistSp(sp: String) {
+        spToken = sp
+        runCatching { spWriter(sp) }
+    }
+
+    private fun forgetSp() {
+        spToken = null
+        runCatching { spWriter("") }
+    }
+
+    private suspend fun postPrepare(params: Map<String, String>): String {
+        val payload = params.entries.joinToString(",", "{", "}") { (k, v) -> "${q(k)}:${q(v)}" }
+        val request = Request.Builder()
+            .url("${base}/prepare")
+            .post(payload.toRequestBody("application/json".toMediaType()))
+            .browserHeaders()
+            .header("Content-Type", "application/json")
+            .header("Referer", "${base}/")
+            .header("Origin", base)
+            .build()
+        return client.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) throw IllegalStateException("HTTP ${response.code}")
+            response.body?.string()?.takeIf { it.isNotBlank() }
+                ?: throw IllegalStateException("Empty response")
+        }
     }
 
     /** Visible for tests: whether [prepareToken] would currently short-circuit. */

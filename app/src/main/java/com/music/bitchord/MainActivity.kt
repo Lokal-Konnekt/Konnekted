@@ -45,6 +45,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.asPaddingValues
+import androidx.compose.foundation.layout.safeDrawing
 import androidx.compose.foundation.layout.statusBarsPadding
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.widthIn
@@ -146,6 +148,8 @@ import kotlinx.coroutines.withContext
 import com.music.bitchord.data.model.durationMillis
 import com.music.bitchord.data.scrobbling.LastFM
 import com.music.bitchord.data.settings.AppSettings
+import com.music.bitchord.data.sources.FlacDownloaderApi
+import com.music.bitchord.ui.components.FdlUnlockSheet
 import com.music.bitchord.data.settings.LibrarySort
 import com.music.bitchord.data.settings.ThemeMode
 import com.music.bitchord.ui.components.AccountProfileSelector
@@ -266,6 +270,8 @@ import com.music.bitchord.ui.player.NowPlayingScreen
 import com.music.bitchord.ui.player.PlayerSheetMotion
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.draw.drawBehind
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
 import androidx.compose.ui.window.DialogWindowProvider
 import androidx.compose.ui.graphics.Shape
 import androidx.compose.ui.graphics.Outline
@@ -576,6 +582,7 @@ private fun BitChordApp(
     var showListenBrainzLogin by remember { mutableStateOf(false) }
     var showLastfmLogin by remember { mutableStateOf(false) }
     var showWebDavEditor by remember { mutableStateOf(false) }
+    var showFdlUnlock by remember { mutableStateOf(false) }
     var showSmbEditor by remember { mutableStateOf(false) }
     /**
      * Whether the download manager is open.
@@ -2927,6 +2934,7 @@ private fun BitChordApp(
                             onEditWebDav = { showWebDavEditor = true },
                             onEditSmb = { showSmbEditor = true },
                             onConfirmJioSaavn = { confirmJioSaavn = true },
+                            onUnlockHires = { showFdlUnlock = true },
                         )
                     } else if (key == "listen_together") {
                         ListenTogetherScreen(
@@ -3506,6 +3514,7 @@ private fun BitChordApp(
                                 onEditWebDav = { showWebDavEditor = true },
                                 onEditSmb = { showSmbEditor = true },
                                 onConfirmJioSaavn = { confirmJioSaavn = true },
+                                onUnlockHires = { showFdlUnlock = true },
                             )
                         }
                     }
@@ -5220,6 +5229,34 @@ private fun BitChordApp(
                 },
                 onDismiss = { showWebDavEditor = false },
             )
+        }
+
+        if (showFdlUnlock) {
+            BackHandler { showFdlUnlock = false }
+            Dialog(
+                onDismissRequest = { showFdlUnlock = false },
+                properties = DialogProperties(
+                    usePlatformDefaultWidth = false,
+                    decorFitsSystemWindows = false,
+                ),
+            ) {
+                Box(
+                    Modifier
+                        .fillMaxSize()
+                        .background(MaterialTheme.colorScheme.background)
+                        .padding(WindowInsets.safeDrawing.asPaddingValues()),
+                ) {
+                    FdlUnlockSheet(
+                        onUnlocked = { sp ->
+                            AppSettings.setFdlSp(sp)
+                            FlacDownloaderApi.loadSp(sp)
+                            showQueueNotice("Hi-Res unlocked")
+                            showFdlUnlock = false
+                        },
+                        onDismiss = { showFdlUnlock = false },
+                    )
+                }
+            }
         }
 
         if (showSmbEditor) {

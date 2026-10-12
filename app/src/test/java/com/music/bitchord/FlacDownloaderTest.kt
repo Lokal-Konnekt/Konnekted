@@ -52,6 +52,10 @@ class FlacDownloaderTest {
     @After
     fun tearDown() {
         FlacDownloaderApi.baseOverride = null
+        FlacDownloaderApi.loadSp(null)
+        FlacDownloaderApi.clearTokenBlock()
+        FlacDownloaderApi.spReader = { "" }
+        FlacDownloaderApi.spWriter = {}
         server.shutdown()
     }
 
@@ -112,6 +116,9 @@ class FlacDownloaderTest {
         pretty: String = "Artist - Title.flac",
         pendingFirst: Int = 1,
     ) {
+        // Every handshake runs on an sp session now: seed one like the
+        // unlock would have, and clear it after in each test's finally.
+        FlacDownloaderApi.loadSp("sp-test")
         route("/prepare", if (token == null) """{"error":"challenge_failed"}""" else """{"t":"$token"}""")
         route("/api/qobuz/queue", """{"id":"$jobId"}""")
         var polls = 0
@@ -199,14 +206,14 @@ class FlacDownloaderTest {
     }
 
     @Test
-    fun `a passing challenge clears the block`() = runBlocking {
+    fun `without a session there is nothing to try`() = runBlocking {
         FlacDownloaderApi.clearTokenBlock()
-        route("/prepare", """{"error":"challenge_failed"}""")
-        assertNull(FlacDownloaderApi.prepareToken())
-        assertTrue(FlacDownloaderApi.isTokenBlocked())
+        FlacDownloaderApi.loadSp(null)
         route("/prepare", """{"t":"tok-live"}""")
-        assertEquals("tok-live", FlacDownloaderApi.prepareToken(force = true))
-        assertTrue(!FlacDownloaderApi.isTokenBlocked())
+        assertNull(FlacDownloaderApi.prepareToken(force = true))
+        assertTrue(FlacDownloaderApi.isTokenBlocked())
+        val hits = seen.count { it.requestUrl?.encodedPath == "/prepare" }
+        assertEquals(0, hits)
         FlacDownloaderApi.clearTokenBlock()
     }
 
@@ -232,6 +239,44 @@ class FlacDownloaderTest {
         assertTrue(sent.toString(), sent.all { "Chrome" in it })
         val lang = seen.mapNotNull { it.getHeader("Accept-Language") }
         assertTrue(lang.isNotEmpty())
+    }
+
+    @Test
+    fun `sp session exchanges without challenge`() = runBlocking {
+        var stored = ""
+        FlacDownloaderApi.spReader = { stored }
+        FlacDownloaderApi.spWriter = { stored = it }
+        try {
+            FlacDownloaderApi.loadSp("sp-live")
+            route("/prepare", """{"t":"tok-sp","sp":"sp-rotated"}""")
+            assertEquals("tok-sp", FlacDownloaderApi.prepareToken(force = true))
+            assertEquals("sp-rotated", stored)
+            val bodies = seen.filter { it.requestUrl?.encodedPath == "/prepare" }
+                .map { it.body.readUtf8() }
+            assertTrue(bodies.isNotEmpty() && bodies.all { "sp" in it })
+        } finally {
+            FlacDownloaderApi.loadSp(null)
+            FlacDownloaderApi.spReader = { "" }
+            FlacDownloaderApi.spWriter = {}
+        }
+    }
+
+    @Test
+    fun `dead sp is dropped and falls back to blocked`() = runBlocking {
+        var stored = "sp-dead"
+        FlacDownloaderApi.spReader = { stored }
+        FlacDownloaderApi.spWriter = { stored = it }
+        try {
+            route("/prepare", """{"error":"gone"}""")
+            assertNull(FlacDownloaderApi.prepareToken(force = true))
+            assertEquals("", stored)
+            assertTrue(FlacDownloaderApi.isTokenBlocked())
+        } finally {
+            FlacDownloaderApi.loadSp(null)
+            FlacDownloaderApi.spReader = { "" }
+            FlacDownloaderApi.spWriter = {}
+            FlacDownloaderApi.clearTokenBlock()
+        }
     }
 
     @Test

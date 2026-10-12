@@ -2,6 +2,7 @@ package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.model.Song
+import com.music.bitchord.data.settings.AppSettings
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
@@ -56,6 +57,8 @@ class FlacDownloaderSource(
         // and "Unreachable" would be the wrong shape for half-working.
         return if (FlacDownloaderApi.prepareToken() != null) {
             SourceHealth.Ok("flacdownloader.com · Qobuz FLAC")
+        } else if (AppSettings.fdlSp.value.isBlank()) {
+            SourceHealth.Ok("tap to unlock in browser")
         } else {
             SourceHealth.Ok("catalogue ok · conversions blocked on this network")
         }
