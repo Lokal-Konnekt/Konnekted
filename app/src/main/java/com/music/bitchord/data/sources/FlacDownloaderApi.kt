@@ -2,6 +2,7 @@ package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.Http
 import com.music.bitchord.data.TrackLog
+import java.util.Collections
 import java.util.concurrent.TimeUnit
 import kotlinx.coroutines.delay
 import kotlinx.coroutines.ensureActive
@@ -65,6 +66,20 @@ object FlacDownloaderApi {
         coerceInputValues = true
     }
 
+    /**
+     * When a token was last refused by the backend's challenge, until which
+     * no new attempt is made. A challenged network answers every attempt
+     * identically, so retrying per track would hold each upgrade walk for
+     * the full retry budget accomplishing nothing — the miss has to cost
+     * milliseconds, not seconds. A success clears it; an explicit user
+     * Test bypasses it (see [prepareToken]).
+     */
+    @Volatile
+    private var tokenBlockedUntilMs = 0L
+    private const val TOKEN_BLOCK_MS = 10 * 60 * 1000L
+    private const val TOKEN_ATTEMPTS = 3
+    private const val TOKEN_RETRY_DELAY_MS = 1_500L
+
     private val client: OkHttpClient by lazy {
         Http.client.newBuilder()
             .callTimeout(20, TimeUnit.SECONDS)
@@ -118,6 +133,34 @@ object FlacDownloaderApi {
         @SerialName("title") val title: String = "",
         @SerialName("isrc") val isrc: String? = null,
     )
+
+    /**
+     * What a search row needs later at queue time, parked by packed id.
+     *
+     * Lives here rather than on any source instance because instances are
+     * rebuilt whenever configs change: a memo on the instance strands
+     * every row it minted the moment the registry rebuilds, and the stream
+     * call then misses on tracks just found. Qobuz ids are global, so one
+     * bounded map serves all instances.
+     */
+    data class Origin(
+        val qobuzUrl: String,
+        val title: String,
+        val artist: String,
+        val durationSec: Int?,
+    )
+
+    private val origins = Collections.synchronizedMap(
+        object : LinkedHashMap<String, Origin>(64, 0.75f, true) {
+            override fun removeEldestEntry(eldest: Map.Entry<String, Origin>) = size > 128
+        },
+    )
+
+    fun memoizeOrigin(packed: String, origin: Origin) {
+        origins[packed] = origin
+    }
+
+    fun originOf(packed: String): Origin? = origins[packed]
 
     /** A converted file waiting on the backend's CDN. */
     data class ResolvedFile(
@@ -180,19 +223,33 @@ object FlacDownloaderApi {
      * network. Null is environmental and worth logging once: every queue
      * attempt without it fails identically, so callers check this first.
      */
-    suspend fun prepareToken(): String? {
-        return try {
-            val body = get("${base}/prepare")
-            json.decodeFromString<TokenResponse>(body).token?.takeIf { it.isNotBlank() }
-                ?: run {
-                    TrackLog.w(TAG, "  ✗ hifiresolver prepare refused (challenge?)")
-                    null
+    suspend fun prepareToken(force: Boolean = false): String? {
+        if (!force && System.currentTimeMillis() < tokenBlockedUntilMs) return null
+        repeat(TOKEN_ATTEMPTS) { attempt ->
+            try {
+                val token = json.decodeFromString<TokenResponse>(get("${base}/prepare"))
+                    .token?.takeIf { it.isNotBlank() }
+                if (token != null) {
+                    tokenBlockedUntilMs = 0L
+                    return token
                 }
-        } catch (e: Exception) {
-            coroutineContext.ensureActive()
-            TrackLog.d(TAG, "  ✗ hifiresolver prepare failed: ${e.message}")
-            null
+                TrackLog.w(TAG, "  ✗ hifiresolver prepare refused (challenge?)")
+            } catch (e: Exception) {
+                coroutineContext.ensureActive()
+                TrackLog.d(TAG, "  ✗ hifiresolver prepare failed: ${e.message}")
+            }
+            if (attempt + 1 < TOKEN_ATTEMPTS) delay(TOKEN_RETRY_DELAY_MS)
         }
+        tokenBlockedUntilMs = System.currentTimeMillis() + TOKEN_BLOCK_MS
+        return null
+    }
+
+    /** Visible for tests: whether [prepareToken] would currently short-circuit. */
+    internal fun isTokenBlocked(): Boolean = System.currentTimeMillis() < tokenBlockedUntilMs
+
+    /** Test hook: reset the challenge backoff between cases. */
+    internal fun clearTokenBlock() {
+        tokenBlockedUntilMs = 0L
     }
 
     private suspend fun queueJob(

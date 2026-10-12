@@ -186,6 +186,43 @@ class FlacDownloaderTest {
     }
 
     @Test
+    fun `challenge backs off and short-circuits repeat attempts`() = runBlocking {
+        FlacDownloaderApi.clearTokenBlock()
+        route("/prepare", """{"error":"challenge_failed"}""")
+        assertNull(FlacDownloaderApi.prepareToken())
+        assertTrue(FlacDownloaderApi.isTokenBlocked())
+        val seenBefore = seen.count { it.requestUrl?.encodedPath == "/prepare" }
+        assertNull(FlacDownloaderApi.prepareToken())
+        val seenAfter = seen.count { it.requestUrl?.encodedPath == "/prepare" }
+        assertEquals(seenBefore, seenAfter)
+        FlacDownloaderApi.clearTokenBlock()
+    }
+
+    @Test
+    fun `a passing challenge clears the block`() = runBlocking {
+        FlacDownloaderApi.clearTokenBlock()
+        route("/prepare", """{"error":"challenge_failed"}""")
+        assertNull(FlacDownloaderApi.prepareToken())
+        assertTrue(FlacDownloaderApi.isTokenBlocked())
+        route("/prepare", """{"t":"tok-live"}""")
+        assertEquals("tok-live", FlacDownloaderApi.prepareToken(force = true))
+        assertTrue(!FlacDownloaderApi.isTokenBlocked())
+        FlacDownloaderApi.clearTokenBlock()
+    }
+
+    @Test
+    fun `origins survive any instance`() = runBlocking {
+        route("/api/qobuz/search", searchJson("Blinding Lights"))
+        val first = source()
+        val row = first.search("Blinding Lights", limit = 5).first()
+        val packed = SourceRegistry.parseTrackKey(row.videoId)?.second
+        assertNotNull(packed)
+        // A rebuilt instance (new config id, cold memo) still resolves it:
+        // origins live on the API object, not the source.
+        assertNotNull(FlacDownloaderApi.originOf(packed!!))
+    }
+
+    @Test
     fun `kind carries the branded display name`() {
         assertEquals("BitChord Hi-Res Lossless Addon", SourceRegistry.HIRES_DISPLAY_NAME)
         assertEquals(SourceKind.HIRES, source().kind)

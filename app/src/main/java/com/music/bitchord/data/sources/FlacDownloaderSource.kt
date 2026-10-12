@@ -2,7 +2,6 @@ package com.music.bitchord.data.sources
 
 import com.music.bitchord.data.TrackLog
 import com.music.bitchord.data.model.Song
-import java.util.Collections
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
 import kotlinx.coroutines.ensureActive
@@ -32,34 +31,33 @@ class FlacDownloaderSource(
 
     /**
      * What a search row needs later at queue time, by the packed id handed
-     * out in [search]. The queue call wants the Qobuz URL plus the title
-     * and artist it was matched under — none of which belong in a track id
-     * that travels through queues, history and notifications.
+     * out in [search]. Parked on the API object — see
+     * [FlacDownloaderApi.memoizeOrigin] for why an instance memo strands rows.
      */
-    private data class Origin(
-        val qobuzUrl: String,
-        val title: String,
-        val artist: String,
-        val durationSec: Int?,
-    )
-
-    private val origins = Collections.synchronizedMap(
-        object : LinkedHashMap<String, Origin>(64, 0.75f, true) {
-            override fun removeEldestEntry(eldest: Map.Entry<String, Origin>) = size > MAX_ORIGINS
-        },
-    )
+    private fun memoize(packed: String, qobuzUrl: String, title: String, artist: String, durationSec: Int?) =
+        FlacDownloaderApi.memoizeOrigin(
+            packed,
+            FlacDownloaderApi.Origin(qobuzUrl, title, artist, durationSec),
+        )
 
     override suspend fun health(): SourceHealth {
-        return try {
+        try {
             // An empty catalogue still proves the backend is there; only a
             // failed call means it isn't. (The search call itself never
             // throws — it answers empty — so the probe goes underneath it.)
             FlacDownloaderApi.probe()
             TrackLog.d(TAG, "  ✓ hifiresolver catalogue answers")
-            SourceHealth.Ok("flacdownloader.com · Qobuz FLAC")
         } catch (e: Exception) {
             coroutineContext.ensureActive()
-            SourceHealth.Unreachable(e.message ?: "No answer")
+            return SourceHealth.Unreachable(e.message ?: "No answer")
+        }
+        // Second leg, stated plainly on the sources screen: a catalogue
+        // that answers while conversions stay challenged streams nothing,
+        // and "Unreachable" would be the wrong shape for half-working.
+        return if (FlacDownloaderApi.prepareToken() != null) {
+            SourceHealth.Ok("flacdownloader.com · Qobuz FLAC")
+        } else {
+            SourceHealth.Ok("catalogue ok · conversions blocked on this network")
         }
     }
 
@@ -102,7 +100,7 @@ class FlacDownloaderSource(
         val packed = id.toString()
         val qobuzUrl = url?.takeIf { it.isNotBlank() } ?: "https://open.qobuz.com/track/$id"
         val durationSec = durationMs?.takeIf { it > 0 }?.div(1000)?.toInt()
-        origins[packed] = Origin(qobuzUrl, title, artist, durationSec)
+        memoize(packed, qobuzUrl, title, artist, durationSec)
         val duration = durationSec?.let { s -> "%d:%02d".format(Locale.ROOT, s / 60, s % 60) }
         return Song(
             videoId = SourceRegistry.trackKey(config.id, packed),
@@ -117,7 +115,7 @@ class FlacDownloaderSource(
     }
 
     override suspend fun stream(trackId: String, request: StreamRequest): SourceStream? {
-        val origin = origins[trackId] ?: return null
+        val origin = FlacDownloaderApi.originOf(trackId) ?: return null
         val formatIds = when (request) {
             // Best-first; a lower FLAC that answers is still lossless.
             is StreamRequest.Lossless -> FlacDownloaderApi.LOSSLESS_FORMATS
@@ -153,6 +151,5 @@ class FlacDownloaderSource(
 
     companion object {
         private const val TAG = "BitChord"
-        private const val MAX_ORIGINS = 128
     }
 }
