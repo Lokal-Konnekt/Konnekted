@@ -2,7 +2,9 @@ package com.music.bitchord
 
 import com.music.bitchord.data.sources.FlacDownloaderApi
 import com.music.bitchord.data.sources.FlacDownloaderSource
+import com.music.bitchord.data.sources.HiResMonochromeBackend
 import com.music.bitchord.data.sources.SourceConfig
+import com.music.bitchord.data.sources.SourceHealth
 import com.music.bitchord.data.sources.SourceKind
 import com.music.bitchord.data.sources.SourceRegistry
 import com.music.bitchord.data.sources.StreamRequest
@@ -20,9 +22,10 @@ import org.junit.Before
 import org.junit.Test
 
 /**
- * The flacdownloader.com backend, end to end against a real HTTP server:
- * search mapping, the token → queue → poll handshake, tier fallback, and
- * every failure shaped as a miss rather than a fault.
+ * The flacdownloader.com backend plus the Hi-Res direct-FLAC fallback, end
+ * to end against a real HTTP server: search mapping, the token → queue →
+ * poll handshake, tier fallback, catalogue merging, and every failure
+ * shaped as a miss rather than a fault.
  *
  * The live backend's `/prepare` is bot-gated from datacenter networks, so
  * no test here touches it — the mock stands in for a network the challenge
@@ -47,11 +50,13 @@ class FlacDownloaderTest {
         }
         server.start()
         FlacDownloaderApi.baseOverride = server.url("/").toString().trimEnd('/')
+        HiResMonochromeBackend.baseOverride = server.url("/").toString().trimEnd('/')
     }
 
     @After
     fun tearDown() {
         FlacDownloaderApi.baseOverride = null
+        HiResMonochromeBackend.resetForTests()
         FlacDownloaderApi.loadSp(null)
         FlacDownloaderApi.clearTokenBlock()
         FlacDownloaderApi.spReader = { "" }
@@ -74,6 +79,26 @@ class FlacDownloaderTest {
     }.joinToString(",")}
         ]}
     """.trimIndent()
+
+    private fun directJson(
+        id: Long = 777,
+        title: String = "Creepin",
+        artist: String = "Metro Boomin",
+        durationMs: Long = 221520,
+        isrc: String = "USSM12208949",
+    ) = """
+        {"tracks":[{
+            "id":$id,"title":"$title","artistNames":["$artist"],
+            "duration":$durationMs,"artwork":"https://art/direct.jpg",
+            "albumTitle":"Heroes & Villains","isrc":"$isrc",
+            "explicit":false,"playable":true
+        }]}
+    """.trimIndent()
+
+    private fun directFile(id: Long, sizeBytes: Long, code: Int = 200) {
+        routes["/track/$id"] = MockResponse().setResponseCode(code)
+            .addHeader("Content-Length", sizeBytes.toString())
+    }
 
     // ── Search ──────────────────────────────────────────────────────
 
@@ -105,6 +130,39 @@ class FlacDownloaderTest {
         assertTrue(FlacDownloaderApi.titlesMatch("Blinding Lights", "Blinding Lights (Remastered)"))
         assertTrue(FlacDownloaderApi.titlesMatch("Song feat. Someone", "Song"))
         assertTrue(!FlacDownloaderApi.titlesMatch("Blinding Lights", "Save Your Tears"))
+    }
+
+    @Test
+    fun `search merges downloader and direct catalogue rows`() = runBlocking {
+        route("/api/qobuz/search", searchJson("Blinding Lights"))
+        route("/search/tracks", directJson())
+        val rows = source().search("Blinding Lights Creepin", limit = 10)
+        assertEquals(2, rows.size)
+        assertEquals("Blinding Lights", rows[0].title)
+        assertEquals("Creepin", rows[1].title)
+        assertEquals("Metro Boomin", rows[1].artist)
+        assertEquals("LOSSLESS", rows[1].sourceQuality)
+        val packed = innerId(rows[1].videoId)
+        assertTrue(packed.startsWith("m:"))
+        assertNotNull(HiResMonochromeBackend.originOf(packed))
+    }
+
+    @Test
+    fun `search does not duplicate a recording held by both catalogues`() = runBlocking {
+        route("/api/qobuz/search", searchJson("Creepin"))
+        route("/search/tracks", directJson(artist = "The Artist"))
+        val rows = source().search("Creepin", limit = 10)
+        assertEquals(1, rows.size)
+        assertTrue(!innerId(rows[0].videoId).startsWith("m:"))
+    }
+
+    @Test
+    fun `direct rows expose album and credits`() = runBlocking {
+        route("/search/tracks", directJson())
+        val row = source().search("Creepin", limit = 5).single()
+        assertEquals("Heroes & Villains", row.albumName)
+        assertEquals("https://art/direct.jpg", row.thumbnailUrl)
+        assertEquals(false, row.isExplicit)
     }
 
     // ── Full handshake ──────────────────────────────────────────────
@@ -164,6 +222,47 @@ class FlacDownloaderTest {
     }
 
     @Test
+    fun `direct stream measures size into hi-res figures`() = runBlocking {
+        route("/search/tracks", directJson())
+        directFile(id = 777, sizeBytes = 74_310_837)
+        val src = source()
+        val trackId = innerId(src.search("Creepin", limit = 5).single().videoId)
+        val stream = src.stream(trackId, StreamRequest.Lossless)
+        assertNotNull(stream)
+        assertTrue(stream!!.url.contains("/track/777"))
+        assertEquals("flac", stream.format.codec)
+        assertEquals(true, stream.format.isLossless)
+        assertEquals(2683, stream.format.kbps)
+        assertEquals(24, stream.format.bitDepth)
+        assertEquals(96_000, stream.format.sampleRateHz)
+        assertEquals(false, stream.belowRequest)
+        assertEquals(221, stream.durationSec)
+    }
+
+    @Test
+    fun `direct stream refuses a below-lossless file`() = runBlocking {
+        route("/search/tracks", directJson(id = 888, durationMs = 200_000))
+        directFile(id = 888, sizeBytes = 1_000_000)
+        val src = source()
+        val trackId = innerId(src.search("Creepin", limit = 5).single().videoId)
+        assertNull(src.stream(trackId, StreamRequest.Lossless))
+    }
+
+    @Test
+    fun `locked downloader rows fall back to the direct catalogue`() = runBlocking {
+        route("/api/qobuz/search", searchJson("Locked Song"))
+        route("/search/tracks", directJson(title = "Locked Song", artist = "The Artist", durationMs = 200_000))
+        directFile(id = 777, sizeBytes = 30_000_000)
+        prepareHandshake(token = null)
+        val src = source()
+        val trackId = innerId(src.search("Locked Song", limit = 5).first().videoId)
+        val stream = src.stream(trackId, StreamRequest.Lossless)
+        assertNotNull(stream)
+        assertTrue(stream!!.url.contains("/track/777"))
+        assertEquals("flac", stream.format.codec)
+    }
+
+    @Test
     fun `mp3 fallback is marked below a lossless request`() = runBlocking {
         // Search tested separately; drive resolveStream through the mock
         // directly for the tier assertion.
@@ -179,10 +278,40 @@ class FlacDownloaderTest {
     }
 
     @Test
+    fun `seconds arrive as milliseconds without becoming hours`() {
+        assertEquals(200_000L, HiResMonochromeBackend.normalizeDurationMs(200))
+        assertEquals(200_000L, HiResMonochromeBackend.normalizeDurationMs(200_000))
+    }
+
+    @Test
+    fun `size maps to the least resolution it implies`() {
+        val cd = HiResMonochromeBackend.fileFrom("https://host/track/1", 8_000_000, 60_000)
+        assertEquals(1066, cd.kbps)
+        assertEquals(16, cd.bitDepth)
+        assertEquals(44_100, cd.sampleRateHz)
+        val hires = HiResMonochromeBackend.fileFrom("https://host/track/2", 74_310_837, 221_520)
+        assertEquals(2683, hires.kbps)
+        assertEquals(24, hires.bitDepth)
+        assertEquals(96_000, hires.sampleRateHz)
+    }
+
+    @Test
     fun `health is ok when the catalogue answers`() = runBlocking {
         route("/api/qobuz/search", searchJson("x"))
         val health = source().health()
         assertTrue(health.isOk)
+    }
+
+    @Test
+    fun `health names the direct fallback while qobuz stays locked`() = runBlocking {
+        route("/api/qobuz/search", searchJson("x"))
+        route("/search/tracks", """{"tracks":[]}""")
+        val health = source().health()
+        assertTrue(health.isOk)
+        assertEquals(
+            "tap to unlock Qobuz · direct FLAC ready",
+            (health as SourceHealth.Ok).detail,
+        )
     }
 
     @Test
