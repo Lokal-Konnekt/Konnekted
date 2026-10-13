@@ -21,26 +21,58 @@ jobs:
         cache: gradle
 
     - name: Setup Secrets (Keystore & local.properties)
+      id: signing
+      env:
+        LASTFM_API_KEY: ${{ secrets.LASTFM_API_KEY }}
+        LASTFM_SECRET: ${{ secrets.LASTFM_SECRET }}
+        KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+        KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
       run: |
-        echo "LASTFM_API_KEY=${{ secrets.LASTFM_API_KEY }}" > local.properties
-        echo "LASTFM_SECRET=${{ secrets.LASTFM_SECRET }}" >> local.properties
-
-        echo "${{ secrets.KEYSTORE_BASE64 }}" | base64 -d > bitchord-release.jks
         {
-          echo "storeFile=bitchord-release.jks"
-          echo "storePassword=${{ secrets.KEYSTORE_PASSWORD }}"
-          echo "keyAlias=${{ secrets.KEY_ALIAS }}"
-          echo "keyPassword=${{ secrets.KEY_PASSWORD }}"
-        } > keystore.properties
+          echo "LASTFM_API_KEY=$LASTFM_API_KEY"
+          echo "LASTFM_SECRET=$LASTFM_SECRET"
+        } > local.properties
+
+        if [[ -n "$KEYSTORE_BASE64" && -n "$KEYSTORE_PASSWORD" && -n "$KEY_ALIAS" && -n "$KEY_PASSWORD" ]]; then
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > bitchord-release.jks
+
+          if [[ ! -s bitchord-release.jks ]]; then
+            echo "::error::KEYSTORE_BASE64 is set, but decoded to an empty keystore."
+            exit 1
+          fi
+
+          # Validate the keystore before Gradle reaches packageProdRelease.
+          if ! keytool -list -keystore bitchord-release.jks -storepass "$KEYSTORE_PASSWORD" -alias "$KEY_ALIAS" >/dev/null 2>&1; then
+            echo "::error::The configured keystore, password, or key alias is invalid."
+            exit 1
+          fi
+
+          {
+            echo "storeFile=bitchord-release.jks"
+            echo "storePassword=$KEYSTORE_PASSWORD"
+            echo "keyAlias=$KEY_ALIAS"
+            echo "keyPassword=$KEY_PASSWORD"
+          } > keystore.properties
+
+          echo "mode=signed" >> "$GITHUB_OUTPUT"
+          echo "Release signing configured and validated."
+        else
+          rm -f bitchord-release.jks keystore.properties
+          echo "mode=unsigned" >> "$GITHUB_OUTPUT"
+          echo "::warning::Release signing secrets are incomplete; building an unsigned APK."
+          echo "The unsigned APK cannot update an existing installation signed with a different key."
+        fi
 
     - name: Grant execute permission for gradlew
       run: chmod +x gradlew
 
-    - name: Build Signed Prod Release APK
+    - name: Build Prod Release APK
       run: ./gradlew assembleProdRelease
 
     - name: Upload APK Artifact
       uses: actions/upload-artifact@v4
       with:
-        name: bitchord-prod-release-signed
+        name: bitchord-prod-release-${{ steps.signing.outputs.mode }}
         path: app/build/outputs/apk/prod/release/*.apk
