@@ -417,10 +417,15 @@ object FlacDownloaderApi {
                         noteFailure("job $jobId finished with no file")
                         return null
                     }
-                    val name = encode(job.prettyName?.takeIf { it.isNotBlank() } ?: file)
+                    // Both segments encoded exactly like the site's own
+                    // client does (encodeURIComponent on each). The file
+                    // name routinely carries spaces and punctuation, and a
+                    // raw space in the path is a dead URL — which is what a
+                    // finished conversion that never plays looks like.
+                    val name = encodeSegment(job.prettyName?.takeIf { it.isNotBlank() } ?: file)
                     clearLastFailure()
                     return ResolvedFile(
-                        url = "${base}/qobuz/files/$file?name=$name",
+                        url = "${base}/qobuz/files/${encodeSegment(file)}?name=$name",
                         formatId = formatId,
                     )
                 }
@@ -565,6 +570,15 @@ object FlacDownloaderApi {
     }
 
     private fun encode(value: String): String = java.net.URLEncoder.encode(value, "UTF-8")
+
+    /**
+     * `encodeURIComponent`, as close as the JDK gets: [URLEncoder] is form
+     * encoding, where a space becomes `+` — correct in a query value, a
+     * literal plus in a path segment. The file segment of a download URL is
+     * a path, so `+` there addresses a file that does not exist.
+     */
+    fun encodeSegment(value: String): String =
+        java.net.URLEncoder.encode(value, "UTF-8").replace("+", "%20")
 
     private fun q(value: String): String = "\"" + value
         .replace("\\", "\\\\")

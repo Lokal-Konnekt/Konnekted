@@ -293,6 +293,41 @@ class FlacDownloaderTest {
     }
 
     @Test
+    fun `finished file urls are encoded like the site encodes them`() = runBlocking {
+        route("/prepare", """{"t":"tok123"}""")
+        FlacDownloaderApi.loadSp("sp-test")
+        try {
+            route("/api/qobuz/queue", """{"id":"job9"}""")
+            server.dispatcher = object : Dispatcher() {
+                override fun dispatch(request: RecordedRequest): MockResponse {
+                    synchronized(seen) { seen += request }
+                    val path = request.requestUrl?.encodedPath.orEmpty()
+                    if (path == "/api/qobuz/jobs/job9") {
+                        return MockResponse().setResponseCode(200).setBody(
+                            """{"status":"done","file":"Metro Boomin - Creepin (with The Weeknd).flac","pretty_name":"Metro Boomin - Creepin.flac"}""",
+                        )
+                    }
+                    return routes[path] ?: MockResponse().setResponseCode(404)
+                }
+            }
+            val file = FlacDownloaderApi.resolveStream(
+                qobuzUrl = "https://open.qobuz.com/track/1",
+                title = "Creepin",
+                artist = "Metro Boomin",
+                formatIds = listOf(FlacDownloaderApi.F_16_44),
+            )
+            assertNotNull(file)
+            // Raw spaces would 404; the site percent-encodes both segments.
+            assertTrue(file!!.url, "%20" in file.url)
+            assertTrue(file.url, " " !in file.url.substringAfter("/qobuz/files/"))
+            assertTrue(file.url, file.url.contains("Metro%20Boomin%20-%20Creepin%20%28with%20The%20Weeknd%29.flac"))
+        } finally {
+            FlacDownloaderApi.loadSp(null)
+            FlacDownloaderApi.clearTokenBlock()
+        }
+    }
+
+    @Test
     fun `queue refusal is recorded for the sources screen`() = runBlocking {
         FlacDownloaderApi.clearLastFailure()
         FlacDownloaderApi.loadSp("sp-test")
