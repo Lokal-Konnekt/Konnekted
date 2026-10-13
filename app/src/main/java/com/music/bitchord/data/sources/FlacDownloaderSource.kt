@@ -5,6 +5,8 @@ import com.music.bitchord.data.model.Song
 import com.music.bitchord.data.settings.AppSettings
 import java.util.Locale
 import kotlin.coroutines.coroutineContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.ensureActive
 
 /**
@@ -42,11 +44,8 @@ class FlacDownloaderSource(
      * out in [search]. Parked on the API object — see
      * [FlacDownloaderApi.memoizeOrigin] for why an instance memo strands rows.
      */
-    private fun memoize(packed: String, qobuzUrl: String, title: String, artist: String, durationSec: Int?) =
-        FlacDownloaderApi.memoizeOrigin(
-            packed,
-            FlacDownloaderApi.Origin(qobuzUrl, title, artist, durationSec),
-        )
+    private fun memoize(origin: FlacDownloaderApi.Origin, packed: String) =
+        FlacDownloaderApi.memoizeOrigin(packed, origin)
 
     override suspend fun health(): SourceHealth {
         val catalogueOk = try {
@@ -69,13 +68,16 @@ class FlacDownloaderSource(
         val directSuffix = if (directOk) " · direct FLAC ready" else ""
         // Second leg, stated plainly on the sources screen: a catalogue
         // that answers while conversions stay challenged streams nothing
-        // from the downloader — but the direct backend still can.
+        // from the downloader — but the direct backend still can. And when a
+        // token exists yet conversions still fail, the last failure rides
+        // along so "says unlocked, streams nothing" names its reason.
+        val failureSuffix = FlacDownloaderApi.lastFailure?.let { " · last conversion: $it" } ?: ""
         return if (FlacDownloaderApi.prepareToken() != null) {
-            SourceHealth.Ok("flacdownloader.com · Qobuz FLAC$directSuffix")
+            SourceHealth.Ok("flacdownloader.com · Qobuz FLAC$directSuffix$failureSuffix")
         } else if (AppSettings.fdlSp.value.isBlank()) {
             SourceHealth.Ok("tap to unlock Qobuz$directSuffix")
         } else {
-            SourceHealth.Ok("catalogue ok · conversions blocked on this network$directSuffix")
+            SourceHealth.Ok("catalogue ok · conversions blocked on this network$directSuffix$failureSuffix")
         }
     }
 
@@ -89,16 +91,51 @@ class FlacDownloaderSource(
         // ISRC precision first, exactly like the plugin: Deezer names the
         // recording, Qobuz is asked for that ISRC, and text search is the
         // fallback rather than the authority.
-        val deezerRows = try {
-            FlacDownloaderApi.deezerRows(q)
-                .filter { FlacDownloaderApi.titlesMatch(q, it.title) }
-        } catch (e: Exception) {
-            coroutineContext.ensureActive()
-            emptyList()
+        //
+        // The three catalogue reads fan out concurrently: run sequentially
+        // they cost the sum of three round trips on every query of every
+        // upgrade race, and the resolver asks two or three queries per
+        // track. Only the ISRC re-search waits on Deezer, since it needs
+        // the ISRCs first.
+        val textHits: List<FlacDownloaderApi.QobuzTrack>
+        val monoRaw: List<HiResMonochromeBackend.MonoTrack>
+        val isrcs: List<String>
+        coroutineScope {
+            val deezer = async {
+                try {
+                    FlacDownloaderApi.deezerRows(q)
+                        .filter { FlacDownloaderApi.titlesMatch(q, it.title) }
+                } catch (e: Exception) {
+                    coroutineContext.ensureActive()
+                    emptyList()
+                }
+            }
+            val text = async {
+                try {
+                    FlacDownloaderApi.searchQobuz(q, limit.coerceIn(1, 50))
+                        .filter { FlacDownloaderApi.isPlayableMatch(q, it.title) }
+                } catch (e: Exception) {
+                    coroutineContext.ensureActive()
+                    TrackLog.d(TAG, "  ✗ hifiresolver search failed: ${e.message}")
+                    emptyList()
+                }
+            }
+            val mono = async {
+                try {
+                    HiResMonochromeBackend.searchTracks(q, limit.coerceIn(1, 50))
+                } catch (e: Exception) {
+                    coroutineContext.ensureActive()
+                    TrackLog.d(TAG, "  ✗ hires direct catalogue search failed: ${e.message}")
+                    emptyList()
+                }
+            }
+            val deezerRows = deezer.await()
+            textHits = text.await()
+            monoRaw = mono.await()
+            isrcs = deezerRows.mapNotNull { it.isrc?.takeIf(String::isNotBlank) }
+                .distinct()
+                .take(3)
         }
-        val isrcs = deezerRows.mapNotNull { it.isrc?.takeIf(String::isNotBlank) }
-            .distinct()
-            .take(3)
         val isrcHits = try {
             isrcs.flatMap { isrc -> FlacDownloaderApi.searchQobuz(isrc, 5) }
                 .filter { FlacDownloaderApi.isPlayableMatch(q, it.title) }
@@ -106,24 +143,8 @@ class FlacDownloaderSource(
             coroutineContext.ensureActive()
             emptyList()
         }
-        val textHits = try {
-            FlacDownloaderApi.searchQobuz(q, limit.coerceIn(1, 50))
-                .filter { FlacDownloaderApi.isPlayableMatch(q, it.title) }
-        } catch (e: Exception) {
-            coroutineContext.ensureActive()
-            TrackLog.d(TAG, "  ✗ hifiresolver search failed: ${e.message}")
-            emptyList()
-        }
-        val monoHits = try {
-            HiResMonochromeBackend.rankByIsrc(
-                HiResMonochromeBackend.searchTracks(q, limit.coerceIn(1, 50)),
-                isrcs.firstOrNull(),
-            ).filter { FlacDownloaderApi.isPlayableMatch(q, it.title) }
-        } catch (e: Exception) {
-            coroutineContext.ensureActive()
-            TrackLog.d(TAG, "  ✗ hires direct catalogue search failed: ${e.message}")
-            emptyList()
-        }
+        val monoHits = HiResMonochromeBackend.rankByIsrc(monoRaw, isrcs.firstOrNull())
+            .filter { FlacDownloaderApi.isPlayableMatch(q, it.title) }
         val flacRows = (isrcHits + textHits).distinctBy { it.id }
         val songs = flacRows.map { it.toSong() }.toMutableList()
         val seen = songs.mapTo(HashSet()) { catalogueKey(it.title, it.artist) }
@@ -142,7 +163,19 @@ class FlacDownloaderSource(
         val packed = id.toString()
         val qobuzUrl = url?.takeIf { it.isNotBlank() } ?: "https://open.qobuz.com/track/$id"
         val durationSec = durationMs?.takeIf { it > 0 }?.div(1000)?.toInt()
-        memoize(packed, qobuzUrl, title, artist, durationSec)
+        memoize(
+            FlacDownloaderApi.Origin(
+                qobuzUrl = qobuzUrl,
+                title = title,
+                artist = artist,
+                durationSec = durationSec,
+                album = album,
+                cover = cover.orEmpty(),
+                isrc = isrc.orEmpty(),
+                explicit = explicit,
+            ),
+            packed,
+        )
         val duration = durationSec?.let { s -> "%d:%02d".format(Locale.ROOT, s / 60, s % 60) }
         return Song(
             videoId = SourceRegistry.trackKey(config.id, packed),
@@ -196,7 +229,7 @@ class FlacDownloaderSource(
             is StreamRequest.Best -> FlacDownloaderApi.LOSSY_FORMATS
         }
         val file = try {
-            FlacDownloaderApi.resolveStream(origin.qobuzUrl, origin.title, origin.artist, formatIds)
+            FlacDownloaderApi.resolveStream(origin, formatIds)
         } catch (e: Exception) {
             coroutineContext.ensureActive()
             TrackLog.d(TAG, "  ✗ hifiresolver stream failed: ${e.message}")

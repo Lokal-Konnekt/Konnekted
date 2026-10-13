@@ -55,10 +55,17 @@ object FlacDownloaderApi {
     val LOSSLESS_FORMATS = listOf(F_24_192, F_24_96, F_16_44)
     val LOSSY_FORMATS = listOf(F_MP3_320)
 
-    /** Wall clock for one resolve across all formats: slow backends lose the race. */
-    const val RESOLVE_BUDGET_MS = 75_000L
+    /**
+     * Wall clock for one resolve across all formats. Four minutes, not
+     * seventy-five seconds: a conversion is server-side work on a free
+     * service, and the site itself polls a job for up to fifteen minutes
+     * before timing out. The upgrade and read-ahead paths that consume this
+     * cancel a resolve the moment nobody is waiting on it, so a long budget
+     * costs radio only while an answer is genuinely still wanted.
+     */
+    const val RESOLVE_BUDGET_MS = 240_000L
     private const val POLL_DELAY_MS = 2_000L
-    private const val MAX_POLLS_PER_FORMAT = 20
+    private const val MAX_POLLS_PER_FORMAT = 60
 
     private val json = Json {
         isLenient = true
@@ -150,12 +157,20 @@ object FlacDownloaderApi {
      * every row it minted the moment the registry rebuilds, and the stream
      * call then misses on tracks just found. Qobuz ids are global, so one
      * bounded map serves all instances.
+     *
+     * The queue endpoint takes the row's full metadata, the way the site's
+     * own client sends it — url/title/artist alone proved too thin once the
+     * backend started validating the rest.
      */
     data class Origin(
         val qobuzUrl: String,
         val title: String,
         val artist: String,
         val durationSec: Int?,
+        val album: String = "",
+        val cover: String = "",
+        val isrc: String = "",
+        val explicit: Boolean = false,
     )
 
     private val origins = Collections.synchronizedMap(
@@ -314,15 +329,47 @@ object FlacDownloaderApi {
         tokenBlockedUntilMs = 0L
     }
 
-    private suspend fun queueJob(
-        token: String,
-        qobuzUrl: String,
-        title: String,
-        artist: String,
-        formatId: Int,
-    ): String? {
-        val payload = "{\"url\":${q(qobuzUrl)},\"title\":${q(title)}," +
-            "\"artist\":${q(artist)},\"formatId\":$formatId}"
+    /**
+     * The last conversion failure, in plain words for the Sources screen.
+     * Queue and poll misses used to vanish into a log line nobody on the
+     * device ever sees, which is how "says unlocked, streams nothing" stayed
+     * a mystery: the token worked and the conversion didn't. Cleared on the
+     * next file that lands.
+     */
+    @Volatile
+    var lastFailure: String? = null
+        private set
+
+    /** Test hook: forget the last recorded conversion failure. */
+    internal fun clearLastFailure() {
+        lastFailure = null
+    }
+
+    private fun noteFailure(message: String) {
+        lastFailure = message.take(160)
+        TrackLog.d(TAG, "  ✗ hifiresolver $message")
+    }
+
+    /**
+     * The queue body, field for field what the site's own client posts.
+     * Pure so the shape is unit-testable: a drift here is silent on the
+     * wire (the backend just refuses the job) and loud nowhere else.
+     */
+    fun queuePayload(origin: Origin, formatId: Int): String {
+        val durationSec = origin.durationSec?.takeIf { it > 0 } ?: 0
+        return "{\"url\":${q(origin.qobuzUrl)}," +
+            "\"title\":${q(origin.title)}," +
+            "\"artist\":${q(origin.artist)}," +
+            "\"album\":${q(origin.album)}," +
+            "\"cover\":${q(origin.cover)}," +
+            "\"isrc\":${q(origin.isrc)}," +
+            "\"duration\":$durationSec," +
+            "\"explicit\":${origin.explicit}," +
+            "\"formatId\":$formatId}"
+    }
+
+    private suspend fun queueJob(token: String, origin: Origin, formatId: Int): String? {
+        val payload = queuePayload(origin, formatId)
         return try {
             val request = Request.Builder()
                 .url("${base}/api/qobuz/queue")
@@ -333,13 +380,22 @@ object FlacDownloaderApi {
                 .header("Referer", "${base}/")
                 .header("Origin", base)
                 .build()
-            val body = client.newCall(request).execute().use { response ->
-                if (!response.isSuccessful) return null
-                response.body?.string()?.takeIf { it.isNotBlank() } ?: return null
+            val (code, body) = client.newCall(request).execute().use { response ->
+                response.code to
+                    (runCatching { response.body?.string() }.getOrNull()?.takeIf { it.isNotBlank() })
+            }
+            if (code != 200 || body == null) {
+                noteFailure("queue refused (HTTP $code): ${(body ?: "empty").take(120)}")
+                return null
             }
             json.decodeFromString<QueueResponse>(body).jobId?.takeIf { it.isNotBlank() }
+                ?: run {
+                    noteFailure("queue answered without a job id: ${body.take(120)}")
+                    null
+                }
         } catch (e: Exception) {
             coroutineContext.ensureActive()
+            noteFailure("queue failed: ${e.message}")
             null
         }
     }
@@ -357,14 +413,21 @@ object FlacDownloaderApi {
             }
             when (job.status) {
                 "done" -> {
-                    val file = job.file?.takeIf { it.isNotBlank() } ?: return null
+                    val file = job.file?.takeIf { it.isNotBlank() } ?: run {
+                        noteFailure("job $jobId finished with no file")
+                        return null
+                    }
                     val name = encode(job.prettyName?.takeIf { it.isNotBlank() } ?: file)
+                    clearLastFailure()
                     return ResolvedFile(
                         url = "${base}/qobuz/files/$file?name=$name",
                         formatId = formatId,
                     )
                 }
-                "error" -> return null
+                "error" -> {
+                    noteFailure("job $jobId errored")
+                    return null
+                }
                 else -> Unit // queued/working: next round
             }
         }
@@ -378,24 +441,38 @@ object FlacDownloaderApi {
      * a fault.
      */
     suspend fun resolveStream(
-        qobuzUrl: String,
-        title: String,
-        artist: String,
+        origin: Origin,
         formatIds: List<Int>,
         budgetMs: Long = RESOLVE_BUDGET_MS,
     ): ResolvedFile? {
-        if (qobuzUrl.isBlank() || formatIds.isEmpty()) return null
+        if (origin.qobuzUrl.isBlank() || formatIds.isEmpty()) return null
         val token = prepareToken() ?: return null
         val deadline = System.currentTimeMillis() + budgetMs
         for (formatId in formatIds) {
             coroutineContext.ensureActive()
-            if (System.currentTimeMillis() >= deadline) break
-            val jobId = queueJob(token, qobuzUrl, title, artist, formatId) ?: continue
+            if (System.currentTimeMillis() >= deadline) {
+                noteFailure("conversion budget spent before a file landed")
+                break
+            }
+            val jobId = queueJob(token, origin, formatId) ?: continue
             val file = pollJob(jobId, formatId)
             if (file != null) return file
         }
         return null
     }
+
+    /** Older call shape, kept for tests: metadata unknown, payload minimal. */
+    suspend fun resolveStream(
+        qobuzUrl: String,
+        title: String,
+        artist: String,
+        formatIds: List<Int>,
+        budgetMs: Long = RESOLVE_BUDGET_MS,
+    ): ResolvedFile? = resolveStream(
+        Origin(qobuzUrl, title, artist, null),
+        formatIds,
+        budgetMs,
+    )
 
     // ── Matching ──────────────────────────────────────────────────────
     // Ported from the plugin's title logic: strip featured/remaster/version
@@ -456,6 +533,11 @@ object FlacDownloaderApi {
      * Sec-Fetch-*) alongside TLS, and OkHttp's bare default (`okhttp/x`)
      * plus a missing language is two free tells. Same neutral Chrome
      * identity the addon client sends.
+     *
+     * The Sec-Fetch trio states what a real `fetch()` from the site's own
+     * page sends: same-origin, cors, empty destination. `none`/`no-cors`
+     * belong on navigations and subresources, and stating them on an XHR
+     * is a small, free bot tell.
      */
     private const val BROWSER_UA =
         "Mozilla/5.0 (Linux; Android 14) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Mobile Safari/537.36"
@@ -464,8 +546,9 @@ object FlacDownloaderApi {
         header("User-Agent", BROWSER_UA)
             .header("Accept", "application/json")
             .header("Accept-Language", "en-US,en;q=0.9")
-            .header("Sec-Fetch-Site", "none")
-            .header("Sec-Fetch-Mode", "no-cors")
+            .header("Sec-Fetch-Site", "same-origin")
+            .header("Sec-Fetch-Mode", "cors")
+            .header("Sec-Fetch-Dest", "empty")
 
     private suspend fun get(url: String): String {
         val request = Request.Builder()

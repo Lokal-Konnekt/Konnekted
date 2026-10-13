@@ -263,6 +263,57 @@ class FlacDownloaderTest {
     }
 
     @Test
+    fun `queue body carries the full row metadata the site posts`() {
+        val payload = FlacDownloaderApi.queuePayload(
+            FlacDownloaderApi.Origin(
+                qobuzUrl = "https://open.qobuz.com/track/1",
+                title = "T",
+                artist = "A",
+                durationSec = 200,
+                album = "Alb",
+                cover = "https://art/0.jpg",
+                isrc = "USXX100000",
+                explicit = true,
+            ),
+            FlacDownloaderApi.F_24_192,
+        )
+        for (field in listOf(
+            """"url":"https://open.qobuz.com/track/1"""",
+            """"title":"T"""",
+            """"artist":"A"""",
+            """"album":"Alb"""",
+            """"cover":"https://art/0.jpg"""",
+            """"isrc":"USXX100000"""",
+            """"duration":200""",
+            """"explicit":true""",
+            """"formatId":27""",
+        )) {
+            assertTrue(field, field in payload)
+        }
+    }
+
+    @Test
+    fun `queue refusal is recorded for the sources screen`() = runBlocking {
+        FlacDownloaderApi.clearLastFailure()
+        FlacDownloaderApi.loadSp("sp-test")
+        route("/prepare", """{"t":"tok123"}""")
+        route("/api/qobuz/queue", """{"error":"nope"}""", 400)
+        val file = FlacDownloaderApi.resolveStream(
+            qobuzUrl = "https://open.qobuz.com/track/1",
+            title = "T",
+            artist = "A",
+            formatIds = listOf(FlacDownloaderApi.F_16_44),
+        )
+        assertNull(file)
+        val failure = FlacDownloaderApi.lastFailure
+        assertNotNull(failure)
+        assertTrue(failure!!, "400" in failure)
+        FlacDownloaderApi.loadSp(null)
+        FlacDownloaderApi.clearTokenBlock()
+        FlacDownloaderApi.clearLastFailure()
+    }
+
+    @Test
     fun `mp3 fallback is marked below a lossless request`() = runBlocking {
         // Search tested separately; drive resolveStream through the mock
         // directly for the tier assertion.
@@ -368,6 +419,12 @@ class FlacDownloaderTest {
         assertTrue(sent.toString(), sent.all { "Chrome" in it })
         val lang = seen.mapNotNull { it.getHeader("Accept-Language") }
         assertTrue(lang.isNotEmpty())
+        // A real fetch() from the site's own page states same-origin/cors;
+        // none/no-cors belongs on navigations and marks the call as foreign.
+        val sites = seen.mapNotNull { it.getHeader("Sec-Fetch-Site") }
+        assertTrue(sites.toString(), sites.isNotEmpty() && sites.all { it == "same-origin" })
+        val modes = seen.mapNotNull { it.getHeader("Sec-Fetch-Mode") }
+        assertTrue(modes.toString(), modes.isNotEmpty() && modes.all { it == "cors" })
     }
 
     @Test
